@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Ollama</title>
+  <link rel="stylesheet" href="/frontend.css">
+  <script src="/frontend.js" defer></script>
+</head>
+<body>
+  <main class="console">
+    <section id="conversation" class="conversation" aria-live="polite"></section>
+    <form id="chat-form" class="prompt-line">
+      <label for="prompt" class="prompt-mark" aria-label="Wiadomość">&gt;&gt;</label>
+      <textarea id="prompt" rows="1" autofocus required aria-describedby="status"></textarea>
+    </form>
+    <button id="dev-stop" class="dev-stop" type="button" hidden>
+      zatrzymaj strumień
+    </button>
+    <p id="status" class="sr-only" aria-live="polite">Gotowy</p>
+  </main>
+</body>
+</html>
