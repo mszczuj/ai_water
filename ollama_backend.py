@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+from contextlib import contextmanager
 import json
 import mimetypes
 import os
 import re
 import sys
+import threading
 import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,7 +23,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:4b"
-DEFAULT_ROUTER_MODEL = "qwen2.5:1.5b"
+DEFAULT_ROUTER_MODEL = "qwen2.5:0.5b"
 # qwen2.5:1.5b
 # DEFAULT_MODEL = "SpeakLeash/bielik-11b-v3.0-instruct:Q4_K_M"
 
@@ -61,6 +64,80 @@ WEB_FILES = {
 }
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 MAX_WEB_REQUEST = 2 * 1024 * 1024
+SERVO_PIN = 9
+SERVO_STREAMING_ANGLE = 180
+SERVO_IDLE_ANGLE = 90
+
+
+class ServoController:
+    """Steruj serwem D9 podczas strumieniowania, nie blokuj rozmowy przy błędzie."""
+
+    def __init__(self, com_port: str | None = None) -> None:
+        self.com_port = com_port
+        self.board: Any | None = None
+        self.active_streams = 0
+        self.lock = threading.Lock()
+
+    def _connect(self) -> None:
+        if self.board is not None:
+            return
+        from telemetrix import telemetrix
+
+        board = telemetrix.Telemetrix(com_port=self.com_port)
+        try:
+            board.set_pin_mode_servo(SERVO_PIN)
+        except Exception:
+            board.shutdown()
+            raise
+        self.board = board
+
+    def begin_stream(self) -> bool:
+        with self.lock:
+            try:
+                self._connect()
+                if self.active_streams == 0:
+                    self.board.servo_write(SERVO_PIN, SERVO_STREAMING_ANGLE)
+                self.active_streams += 1
+                return True
+            except Exception as exc:
+                print(f"[serwo] nie można ustawić 180°: {exc}", file=sys.stderr, flush=True)
+                return False
+
+    def end_stream(self) -> None:
+        with self.lock:
+            self.active_streams -= 1
+            if self.active_streams == 0:
+                try:
+                    self.board.servo_write(SERVO_PIN, SERVO_IDLE_ANGLE)
+                except Exception as exc:
+                    print(
+                        f"[serwo] nie można ustawić 90°: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+    @contextmanager
+    def streaming(self):
+        """Ustaw 180° na czas strumienia i zawsze wróć do 90° po jego końcu."""
+        started = self.begin_stream()
+        try:
+            yield
+        finally:
+            if started:
+                self.end_stream()
+
+    def close(self) -> None:
+        with self.lock:
+            if self.board is None:
+                return
+            try:
+                self.board.servo_write(SERVO_PIN, SERVO_IDLE_ANGLE)
+                self.board.shutdown()
+            except Exception as exc:
+                print(f"[serwo] błąd zamykania: {exc}", file=sys.stderr, flush=True)
+            finally:
+                self.board = None
+                self.active_streams = 0
 
 
 class Console:
@@ -281,6 +358,7 @@ def ollama_chat(
     think: bool | str | None,
     timeout: float,
     console: Console,
+    servo: ServoController,
 ) -> tuple[str, str]:
     """Wyslij rozmowe i na biezaco wypisz thinking oraz content."""
     body: dict[str, Any] = {
@@ -288,6 +366,7 @@ def ollama_chat(
         "messages": messages,
         "stream": True,
         "think": think,
+
     }
     request = Request(
         f"{host}/api/chat",
@@ -301,34 +380,43 @@ def ollama_chat(
     answer_started = False
     console.heading("\n[MYŚLENIE MODELU]")
 
-    with urlopen(request, timeout=timeout) as response:
-        for raw_line in response:
-            if not raw_line.strip():
-                continue
-            try:
-                chunk = json.loads(raw_line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("Ollama zwrocila nieprawidlowy strumien JSON.") from exc
+    servo_attempted = False
+    servo_started = False
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            for raw_line in response:
+                if not raw_line.strip():
+                    continue
+                if not servo_attempted:
+                    servo_attempted = True
+                    servo_started = servo.begin_stream()
+                try:
+                    chunk = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("Ollama zwrocila nieprawidlowy strumien JSON.") from exc
 
-            if chunk.get("error"):
-                raise RuntimeError(str(chunk["error"]))
+                if chunk.get("error"):
+                    raise RuntimeError(str(chunk["error"]))
 
-            message = chunk.get("message") or {}
-            thinking = message.get("thinking") or ""
-            content = message.get("content") or ""
+                message = chunk.get("message") or {}
+                thinking = message.get("thinking") or ""
+                content = message.get("content") or ""
 
-            if thinking:
-                thinking_parts.append(thinking)
-                print(thinking, end="", flush=True)
+                if thinking:
+                    thinking_parts.append(thinking)
+                    print(thinking, end="", flush=True)
 
-            if content:
-                if not answer_started:
-                    if not thinking_parts:
-                        console.info("(model nie zwrocil osobnego toku rozumowania)")
-                    console.heading("\n[ODPOWIEDŹ]")
+                if content:
+                    if not answer_started:
+                        if not thinking_parts:
+                            console.info("(model nie zwrocil osobnego toku rozumowania)")
+                        console.heading("\n[ODPOWIEDŹ]")
                     answer_started = True
-                answer_parts.append(content)
-                print(content, end="", flush=True)
+                    answer_parts.append(content)
+                    print(content, end="", flush=True)
+    finally:
+        if servo_started:
+            servo.end_stream()
 
     if not answer_started:
         if not thinking_parts:
@@ -370,6 +458,7 @@ def make_web_handler(
     system_prompt: str | None,
     matched_system_prompt: str | None,
     timeout: float,
+    servo: ServoController | None,
     webdev: bool = False,
 ) -> type[BaseHTTPRequestHandler]:
     """Zbuduj handler WWW zwiazany z ustawieniami uruchomionego serwera."""
@@ -480,7 +569,8 @@ def make_web_handler(
                     0, {"role": "system", "content": selected_system_prompt}
                 )
             upstream_body = json.dumps(
-                {"model": model, "messages": messages, "stream": True, "think": think},
+                {"model": model, "messages": messages, "stream": True, "think": think,
+         },
                 ensure_ascii=False,
             ).encode("utf-8")
             upstream_request = Request(
@@ -507,12 +597,16 @@ def make_web_handler(
                 )
                 return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.send_header("Cache-Control", "no-cache, no-transform")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-cache, no-transform")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+            except BaseException:
+                upstream.close()
+                raise
             route_metadata = json.dumps(
                 {"route": {"matched": matched, "remember": not matched}},
                 ensure_ascii=False,
@@ -524,11 +618,16 @@ def make_web_handler(
                 )
             print("[backend] strumieniuję myślenie...", flush=True)
             answer_parts: list[str] = []
+            servo_attempted = False
+            servo_started = False
             try:
                 _write_chunk(self, route_metadata)
                 with upstream:
                     for line in upstream:
                         if line.strip():
+                            if servo and not servo_attempted:
+                                servo_attempted = True
+                                servo_started = servo.begin_stream()
                             try:
                                 chunk = json.loads(line.decode("utf-8"))
                                 content = (chunk.get("message") or {}).get("content") or ""
@@ -555,6 +654,9 @@ def make_web_handler(
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+            finally:
+                if servo and servo_started:
+                    servo.end_stream()
 
         @staticmethod
         def _validate_payload(
@@ -598,7 +700,12 @@ def make_web_handler(
     return WebHandler
 
 
-def run_web_server(args: argparse.Namespace, host: str, think: bool | str | None) -> int:
+def run_web_server(
+    args: argparse.Namespace,
+    host: str,
+    think: bool | str | None,
+    servo: ServoController | None,
+) -> int:
     handler = make_web_handler(
         host,
         args.model,
@@ -607,6 +714,7 @@ def run_web_server(args: argparse.Namespace, host: str, think: bool | str | None
         args.system,
         args.matched_system,
         args.timeout,
+        servo,
         args.webdev,
     )
     try:
@@ -685,6 +793,12 @@ def parse_args() -> argparse.Namespace:
         default=600.0,
         help="limit oczekiwania HTTP w sekundach (domyslnie: 600)",
     )
+
+    parser.add_argument(
+        "--servo-enabled",
+        action="store_true",
+        help="włącz obsługę serwa Arduino D9",
+    )
     parser.add_argument("--no-color", action="store_true", help="wylacz kolory ANSI")
     parser.add_argument(
         "--web",
@@ -692,7 +806,6 @@ def parse_args() -> argparse.Namespace:
         help="uruchom interfejs przegladarkowy zamiast konsoli",
     )
     parser.add_argument(
-        "-webdev",
         "--webdev",
         action="store_true",
         help="uruchom WWW w trybie deweloperskim z przyciskiem zatrzymania strumienia",
@@ -707,6 +820,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8000,
         help="port interfejsu WWW (domyslnie: 8000)",
+    )
+    parser.add_argument(
+        "--servo-port",
+        default=os.environ.get("TELEMETRIX_PORT"),
+        help=(
+            "port Arduino dla serwa D9, np. /dev/ttyACM0 lub COM3 "
+            "(domyslnie: TELEMETRIX_PORT lub autodetekcja)"
+        ),
     )
     return parser.parse_args()
 
@@ -727,8 +848,12 @@ def main() -> int:
     if not 0 <= args.web_port <= 65535:
         console.error("Blad: --web-port musi byc w zakresie 0-65535.")
         return 2
+    servo = None
+    if args.servo_enabled:
+        servo = ServoController(args.servo_port)
+        atexit.register(servo.close)
     if args.web or args.webdev:
-        return run_web_server(args, host, think)
+        return run_web_server(args, host, think, servo)
 
     model = args.model
     history: list[dict[str, str]] = []
@@ -829,7 +954,7 @@ def main() -> int:
 
         try:
             _thinking, answer = ollama_chat(
-                host, model, request_messages, think, args.timeout, console
+                host, model, request_messages, think, args.timeout, console, servo
             )
         except KeyboardInterrupt:
             print()
