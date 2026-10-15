@@ -20,6 +20,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from hydrofon import hydrofon
+
 
 DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:4b"
@@ -138,6 +140,44 @@ class ServoController:
             finally:
                 self.board = None
                 self.active_streams = 0
+
+
+class HydrofonController:
+    """Włącz monitorowanie hydrofonu, dopóki trwa co najmniej jeden strumień."""
+
+    def __init__(self) -> None:
+        self.active_streams = 0
+        self.lock = threading.Lock()
+
+    def begin_stream(self) -> bool:
+        with self.lock:
+            try:
+                if self.active_streams == 0:
+                    hydrofon(True)
+                self.active_streams += 1
+                return True
+            except Exception as exc:
+                print(f"[hydrofon] nie można włączyć: {exc}", file=sys.stderr, flush=True)
+                return False
+
+    def end_stream(self) -> None:
+        with self.lock:
+            if self.active_streams == 0:
+                return
+            self.active_streams -= 1
+            if self.active_streams == 0:
+                self._turn_off()
+
+    def _turn_off(self) -> None:
+        try:
+            hydrofon(False)
+        except Exception as exc:
+            print(f"[hydrofon] nie można wyłączyć: {exc}", file=sys.stderr, flush=True)
+
+    def close(self) -> None:
+        with self.lock:
+            self._turn_off()
+            self.active_streams = 0
 
 
 class Console:
@@ -358,7 +398,7 @@ def ollama_chat(
     think: bool | str | None,
     timeout: float,
     console: Console,
-    servo: ServoController,
+    stream_controller: ServoController | HydrofonController | None,
 ) -> tuple[str, str]:
     """Wyslij rozmowe i na biezaco wypisz thinking oraz content."""
     body: dict[str, Any] = {
@@ -380,16 +420,16 @@ def ollama_chat(
     answer_started = False
     console.heading("\n[MYŚLENIE MODELU]")
 
-    servo_attempted = False
-    servo_started = False
+    controller_attempted = False
+    controller_started = False
     try:
         with urlopen(request, timeout=timeout) as response:
             for raw_line in response:
                 if not raw_line.strip():
                     continue
-                if not servo_attempted:
-                    servo_attempted = True
-                    servo_started = servo.begin_stream()
+                if stream_controller and not controller_attempted:
+                    controller_attempted = True
+                    controller_started = stream_controller.begin_stream()
                 try:
                     chunk = json.loads(raw_line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -415,8 +455,8 @@ def ollama_chat(
                     answer_parts.append(content)
                     print(content, end="", flush=True)
     finally:
-        if servo_started:
-            servo.end_stream()
+        if stream_controller and controller_started:
+            stream_controller.end_stream()
 
     if not answer_started:
         if not thinking_parts:
@@ -458,7 +498,7 @@ def make_web_handler(
     system_prompt: str | None,
     matched_system_prompt: str | None,
     timeout: float,
-    servo: ServoController | None,
+    stream_controller: ServoController | HydrofonController | None,
     webdev: bool = False,
 ) -> type[BaseHTTPRequestHandler]:
     """Zbuduj handler WWW zwiazany z ustawieniami uruchomionego serwera."""
@@ -618,16 +658,16 @@ def make_web_handler(
                 )
             print("[backend] strumieniuję myślenie...", flush=True)
             answer_parts: list[str] = []
-            servo_attempted = False
-            servo_started = False
+            controller_attempted = False
+            controller_started = False
             try:
                 _write_chunk(self, route_metadata)
                 with upstream:
                     for line in upstream:
                         if line.strip():
-                            if servo and not servo_attempted:
-                                servo_attempted = True
-                                servo_started = servo.begin_stream()
+                            if stream_controller and not controller_attempted:
+                                controller_attempted = True
+                                controller_started = stream_controller.begin_stream()
                             try:
                                 chunk = json.loads(line.decode("utf-8"))
                                 content = (chunk.get("message") or {}).get("content") or ""
@@ -655,8 +695,8 @@ def make_web_handler(
                 except (BrokenPipeError, ConnectionResetError):
                     pass
             finally:
-                if servo and servo_started:
-                    servo.end_stream()
+                if stream_controller and controller_started:
+                    stream_controller.end_stream()
 
         @staticmethod
         def _validate_payload(
@@ -704,7 +744,7 @@ def run_web_server(
     args: argparse.Namespace,
     host: str,
     think: bool | str | None,
-    servo: ServoController | None,
+    stream_controller: ServoController | HydrofonController | None,
 ) -> int:
     handler = make_web_handler(
         host,
@@ -714,7 +754,7 @@ def run_web_server(
         args.system,
         args.matched_system,
         args.timeout,
-        servo,
+        stream_controller,
         args.webdev,
     )
     try:
@@ -794,10 +834,16 @@ def parse_args() -> argparse.Namespace:
         help="limit oczekiwania HTTP w sekundach (domyslnie: 600)",
     )
 
-    parser.add_argument(
+    hardware = parser.add_mutually_exclusive_group()
+    hardware.add_argument(
         "--servo-enabled",
         action="store_true",
         help="włącz obsługę serwa Arduino D9",
+    )
+    hardware.add_argument(
+        "--hydrofon-enabled",
+        action="store_true",
+        help="włącz hydrofon przez amixer na czas strumienia zamiast serwa",
     )
     parser.add_argument("--no-color", action="store_true", help="wylacz kolory ANSI")
     parser.add_argument(
@@ -848,12 +894,15 @@ def main() -> int:
     if not 0 <= args.web_port <= 65535:
         console.error("Blad: --web-port musi byc w zakresie 0-65535.")
         return 2
-    servo = None
+    stream_controller = None
     if args.servo_enabled:
-        servo = ServoController(args.servo_port)
-        atexit.register(servo.close)
+        stream_controller = ServoController(args.servo_port)
+    elif args.hydrofon_enabled:
+        stream_controller = HydrofonController()
+    if stream_controller is not None:
+        atexit.register(stream_controller.close)
     if args.web or args.webdev:
-        return run_web_server(args, host, think, servo)
+        return run_web_server(args, host, think, stream_controller)
 
     model = args.model
     history: list[dict[str, str]] = []
@@ -954,7 +1003,7 @@ def main() -> int:
 
         try:
             _thinking, answer = ollama_chat(
-                host, model, request_messages, think, args.timeout, console, servo
+                host, model, request_messages, think, args.timeout, console, stream_controller
             )
         except KeyboardInterrupt:
             print()
